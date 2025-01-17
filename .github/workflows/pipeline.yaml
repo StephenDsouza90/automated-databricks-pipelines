@@ -1,0 +1,93 @@
+name: Build Databricks Pipeline
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - <branch_name>
+
+env:
+  CLUSTER_ID: XXXX-XXXXXX-XXXXXXXX # Get this from the Databricks UI
+
+  # In case you need to install a wheel for the project, save the wheel in the databricks file system.
+  WHEEL_PARTIAL_PATH: dbfs:/FileStore/jars/<folder_name>/
+  WHEEL_FULL_PATH: dbfs:/FileStore/jars/<folder_name>/<wheel_name>-0.0.0-py3-none-any.whl
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+        # This is needed incase there is a submodule
+        with:
+          submodules: recursive
+          token: ${{ secrets.GHA_PERSONAL_ACCESS_TOKEN }}
+
+      - name: Install Python 3.10
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.10'
+
+      - name: Build Wheel # Incase you need to install a wheel for the project
+        run: |
+          pip install --upgrade pip
+          pip install wheel
+          python setup.py bdist_wheel
+
+      - name: Install Databricks CLI
+        run: |
+          pip install databricks-cli
+
+      - name: Install jq dependency # Install jq to parse JSON
+        run: |
+          sudo apt-get update && sudo apt-get install -y jq
+
+      - name: Configure Databricks CLI # Databricks host and token can be obtained from the Databricks UI
+        run: |
+          echo "[DEFAULT]
+          host = ${{ secrets.DATABRICKS_HOST }}
+          token = ${{ secrets.DATABRICKS_TOKEN }}" > ~/.databricks.cfg
+
+          echo ${{ secrets.DATABRICKS_TOKEN }} > token-file
+          databricks configure --host ${{ secrets.DATABRICKS_HOST }} --token-file token-file
+          rm -f token-file
+
+          databricks jobs configure --version=2.1
+
+      - name: Uninstall Cached Wheel from the Databricks Cluster Library
+        run: databricks libraries uninstall --cluster-id $CLUSTER_ID --whl $WHEEL_FULL_PATH
+        timeout-minutes: 2
+
+      - name: Upload Wheel to Databricks File System
+        run: databricks fs cp --overwrite dist/*.whl $WHEEL_PARTIAL_PATH -r
+
+      - name: Sync Github Repository Changes to Databricks
+        run: databricks repos update --path /Repos/<folder_name>/<project_name> --branch master
+
+      # Handles multiple workflows
+      - name: Create / Update Databricks Pipelines
+        run: |
+          declare -A JOB_MAPPING
+
+          # WORKFLOW 1
+          JOB_MAPPING["WORKFLOW 1"]="services/databricks/workflow_1.json"
+
+          # WORKFLOW 2
+          JOB_MAPPING["WORKFLOW 1"]="services/databricks/workflow_2.json"
+
+          for JOB_NAME in "${!JOB_MAPPING[@]}"; do
+            JSON_FILE="${JOB_MAPPING[$JOB_NAME]}"
+
+            JOB_ID=$(databricks jobs list --output JSON | jq -r --arg I "$JOB_NAME" '.jobs[] | select(.settings.name == $I) | .job_id')
+
+            if [[ "$JOB_ID" == "" ]]; then
+              echo "Creating a new job: $JOB_NAME"
+              databricks jobs create --json-file "$JSON_FILE"
+            else
+              echo "Updating job $JOB_ID: $JOB_NAME"
+              databricks jobs reset --job-id "$JOB_ID" --json-file "$JSON_FILE"
+            fi
+          done
